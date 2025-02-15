@@ -121,6 +121,7 @@ def generate_pos_neg_label_crop_centers(
         rand_state = np.random.random.__self__  # type: ignore
 
     centers = []
+    labels = []
     fg_indices = np.asarray(fg_indices) if isinstance(fg_indices, Sequence) else fg_indices
     bg_indices = np.asarray(bg_indices) if isinstance(bg_indices, Sequence) else bg_indices
     if len(fg_indices) == 0 and len(bg_indices) == 0:
@@ -138,14 +139,15 @@ def generate_pos_neg_label_crop_centers(
         spatial_size = [spatial_size] * num_samples
 
     for _, shape in enumerate(spatial_size):
-        indices_to_use = fg_indices if rand_state.rand() < pos_ratio else bg_indices
+        (indices_to_use, label) = (fg_indices, 1) if rand_state.rand() < pos_ratio else (bg_indices, 0)
         random_int = rand_state.randint(len(indices_to_use))
         idx = indices_to_use[random_int]
         center = np.array(np.unravel_index(idx, label_spatial_shape)).T.tolist()
         # shift center to range of valid centers
+        labels.append(label)
         centers.append(correct_crop_centers(center, shape, label_spatial_shape, allow_smaller))
 
-    return ensure_tuple(centers)
+    return ensure_tuple(centers), ensure_tuple(labels)
 
 def generate_label_classes_crop_centers(
     spatial_size: Sequence[int] | int,

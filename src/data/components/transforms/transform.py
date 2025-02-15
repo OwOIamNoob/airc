@@ -210,11 +210,11 @@ def cut_centers_transform(image,
       augments = random_augment(gnt, header, sample_size=sample_size, **aug)
       augments = iter(augments)
       with multiprocessing.Pool(processes=num_workers) as p:
-          profiles = p.starmap(transform_compose, tqdm.tqdm(augments, total=sample_size, desc="Augmentation generations"))
+          profiles = p.starmap(transform_compose, tqdm.tqdm(augments, total=sample_size, desc="Augmentation generations", leave=False))
       patch_sizes = [profile[1] for profile in profiles]
-      print(len(profiles), profiles[0][1], profiles[0][0].dtype, profiles[0][0].shape)
-      print(len(patch_sizes))
-      centers = generate_pos_neg_label_crop_centers(  patch_sizes, 
+      # print(len(profiles), profiles[0][1], profiles[0][0].dtype, profiles[0][0].shape)
+      # print(len(patch_sizes))
+      centers, labels = generate_pos_neg_label_crop_centers(  patch_sizes, 
                                                       num_samples=sample_size, 
                                                       pos_ratio=pos_ratio, 
                                                       label_spatial_shape=image.shape[:2],
@@ -225,7 +225,7 @@ def cut_centers_transform(image,
     else:   
       patch_sizes = [profile[1] for profile in profiles]
       if centers is None:
-        centers = generate_pos_neg_label_crop_centers(  patch_sizes, 
+        centers, labels = generate_pos_neg_label_crop_centers(  patch_sizes, 
                                                         num_samples=sample_size, 
                                                         pos_ratio=pos_ratio, 
                                                         label_spatial_shape=image.shape[:2],
@@ -238,14 +238,14 @@ def cut_centers_transform(image,
                       center[1] - patch_size[1] // 2:center[1] + patch_size[1] // 2].copy() 
                       for center, patch_size in zip(centers, patch_sizes)]
     output_sizes =  [profile[2] for profile in profiles]
-    print(np.where(np.array(patch_sizes) == 0)[0])
-    print(np.where(np.array([patch.shape for patch in patches]) == 0)[0])
+    # print(np.where(np.array(patch_sizes) == 0)[0])
+    # print(np.where(np.array([patch.shape for patch in patches]) == 0)[0])
     inputs = iter([(patch, transform, output_size, [header['h'], header['w']]) for patch, transform, output_size in zip(patches, [profile[0] for profile in profiles], output_sizes)])
 
     with multiprocessing.Pool(processes=num_workers) as p:
-        outputs = p.starmap(warp_transform, tqdm.tqdm(inputs, total=sample_size, desc="Augmentation processing:"))
+        outputs = p.starmap(warp_transform, tqdm.tqdm(inputs, total=sample_size, desc="Augmentation processing", leave=False))
     
-    return outputs, profiles, centers
+    return outputs, profiles, centers, labels
 
 if __name__ == "__main__":
     data = cv2.imread("data/v2/2015.png", cv2.IMREAD_UNCHANGED)

@@ -6,6 +6,9 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
 from torchvision.datasets import MNIST
 from torchvision.transforms import transforms
 
+import rootutils
+rootutils.setup_root(__file__, indicator="setup.py", pythonpath=True)
+from src.data.components.river_dataset import *
 
 class RiverDataModule(LightningDataModule):
     """`LightningDataModule` for the MNIST dataset.
@@ -54,21 +57,13 @@ class RiverDataModule(LightningDataModule):
 
     def __init__(
         self,
-        data_dir: str = "data/",
+        pool: RiverDataPool,
+        transform: Compose | None = None,
         seed: int = 200,
-        train_val_test_split: Tuple[int, int, int] = (55_000, 5_000, 10_000),
         batch_size: int = 64,
         num_workers: int = 0,
         pin_memory: bool = False,
     ) -> None:
-        """Initialize a `MNISTDataModule`.
-
-        :param data_dir: The data directory. Defaults to `"data/"`.
-        :param train_val_test_split: The train, validation and test split. Defaults to `(55_000, 5_000, 10_000)`.
-        :param batch_size: The batch size. Defaults to `64`.
-        :param num_workers: The number of workers. Defaults to `0`.
-        :param pin_memory: Whether to pin memory. Defaults to `False`.
-        """
         super().__init__()
 
         # this line allows to access init params with 'self.hparams' attribute
@@ -78,62 +73,34 @@ class RiverDataModule(LightningDataModule):
         # data transformations
         self.transforms = transforms.Compose(
             [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
-        )
-
-        self.data = None
+        ) if not transform else transform
+        self.pool = pool
         self.data_train: Optional[Dataset] = None
         self.data_val: Optional[Dataset] = None
         self.data_test: Optional[Dataset] = None
-
         self.batch_size_per_device = batch_size
 
     @property
     def num_classes(self) -> int:
-        """Get the number of classes.
-
-        :return: The number of MNIST classes (10).
-        """
         return 1
 
     def prepare_data(self) -> None:
-
+        pass
 
     def setup(self, stage: Optional[str] = None) -> None:
-        """Load data. Set variables: `self.data_train`, `self.data_val`, `self.data_test`.
-
-        This method is called by Lightning before `trainer.fit()`, `trainer.validate()`, `trainer.test()`, and
-        `trainer.predict()`, so be careful not to execute things like random split twice! Also, it is called after
-        `self.prepare_data()` and there is a barrier in between which ensures that all the processes proceed to
-        `self.setup()` once the data is prepared and available for use.
-
-        :param stage: The stage to setup. Either `"fit"`, `"validate"`, `"test"`, or `"predict"`. Defaults to ``None``.
-        """
-        # Divide batch size by the number of devices.
-        if self.trainer is not None:
-            if self.hparams.batch_size % self.trainer.world_size != 0:
-                raise RuntimeError(
-                    f"Batch size ({self.hparams.batch_size}) is not divisible by the number of devices ({self.trainer.world_size})."
-                )
-            self.batch_size_per_device = self.hparams.batch_size // self.trainer.world_size
-
         # load and split datasets only if not loaded already
-        if not self.data_train and not self.data_val and not self.data_test:
-            trainset = MNIST(self.hparams.data_dir, train=True, transform=self.transforms)
-            testset = MNIST(self.hparams.data_dir, train=False, transform=self.transforms)
-            dataset = ConcatDataset(datasets=[trainset, testset])
-            self.data_train, self.data_val, self.data_test = random_split(
-                dataset=dataset,
-                lengths=self.hparams.train_val_test_split,
-                generator=torch.Generator().manual_seed(42),
-            )
+        train_cfg, val_cfg = self.pool.augment_crop()
+        self.data_train = RiverDataset(cfg=train_cfg, temporal=self.pool.temporal)
+        self.data_val = RiverDataset(cfg=val_cfg, temporal=self.pool.temporal)
 
     def train_dataloader(self) -> DataLoader[Any]:
         """Create and return the train dataloader.
 
         :return: The train dataloader.
         """
+        dataset = TransformedRiverDataset(self.data_train, transform=self.transform)
         return DataLoader(
-            dataset=self.data_train,
+            dataset=dataset,
             batch_size=self.batch_size_per_device,
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
@@ -145,8 +112,9 @@ class RiverDataModule(LightningDataModule):
 
         :return: The validation dataloader.
         """
+        dataset = TransformedRiverDataset(self.data_val, transform=None)
         return DataLoader(
-            dataset=self.data_val,
+            dataset=dataset,
             batch_size=self.batch_size_per_device,
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
@@ -155,11 +123,11 @@ class RiverDataModule(LightningDataModule):
 
     def test_dataloader(self) -> DataLoader[Any]:
         """Create and return the test dataloader.
-
         :return: The test dataloader.
         """
+        dataset = TransformedRiverDataset(self.data_val, transform=None)
         return DataLoader(
-            dataset=self.data_test,
+            dataset=dataset,
             batch_size=self.batch_size_per_device,
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,

@@ -5,8 +5,11 @@ from lightning import LightningModule
 from torchmetrics import MaxMetric, MeanMetric
 from torchmetrics.classification.accuracy import Accuracy
 
+import rootutils
+rootutils.setup_root(__file__, indicator="setup.py", pythonpath=True)
 
-class MNISTLitModule(LightningModule):
+
+class RiverLitModule(LightningModule):
     """Example of a `LightningModule` for MNIST classification.
 
     A `LightningModule` implements 8 key methods:
