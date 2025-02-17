@@ -59,6 +59,7 @@ class RiverDataModule(LightningDataModule):
         self,
         pool: RiverDataPool,
         transform: Compose | None = None,
+        hard_transform: Compose | None = None,
         seed: int = 200,
         batch_size: int = 64,
         num_workers: int = 0,
@@ -71,9 +72,10 @@ class RiverDataModule(LightningDataModule):
         self.save_hyperparameters(logger=False)
 
         # data transformations
-        self.transforms = transforms.Compose(
+        self.transform = transforms.Compose(
             [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
         ) if not transform else transform
+        self.hard_transform = self.transform if not hard_transform else hard_transform
         self.pool = pool
         self.data_train: Optional[Dataset] = None
         self.data_val: Optional[Dataset] = None
@@ -92,13 +94,14 @@ class RiverDataModule(LightningDataModule):
         train_cfg, val_cfg = self.pool.augment_crop()
         self.data_train = RiverDataset(cfg=train_cfg, temporal=self.pool.temporal)
         self.data_val = RiverDataset(cfg=val_cfg, temporal=self.pool.temporal)
+        self.data_test = RiverDataset(cfg=val_cfg, temporal=self.pool.temporal)
 
     def train_dataloader(self) -> DataLoader[Any]:
         """Create and return the train dataloader.
 
         :return: The train dataloader.
         """
-        dataset = TransformedRiverDataset(self.data_train, transform=self.transform)
+        dataset = TransformedRiverDataset(self.data_train, transform=self.transform, hard_transform=self.hard_transform)
         return DataLoader(
             dataset=dataset,
             batch_size=self.batch_size_per_device,
@@ -112,7 +115,7 @@ class RiverDataModule(LightningDataModule):
 
         :return: The validation dataloader.
         """
-        dataset = TransformedRiverDataset(self.data_val, transform=None)
+        dataset = TransformedRiverDataset(self.data_val, transform=None, hard_transform=None)
         return DataLoader(
             dataset=dataset,
             batch_size=self.batch_size_per_device,
@@ -160,4 +163,20 @@ class RiverDataModule(LightningDataModule):
 
 
 if __name__ == "__main__":
-    _ = MNISTDataModule()
+    import omegaconf
+    from omegaconf import DictConfig
+    import hydra
+    
+    @hydra.main(version_base="1.3", config_path="../../configs", config_name="train.yaml")
+    def main(cfg: DictConfig) -> Optional[float]:
+        datamodule = hydra.utils.instantiate(cfg.data)
+        datamodule.setup()
+        loader = datamodule.train_dataloader()
+        loader = iter(loader)
+        batch = next(loader)
+        print(batch.keys(), 
+                batch['hard'].shape,
+                batch['image'].shape,
+                batch['mask'].shape)
+    
+    main()

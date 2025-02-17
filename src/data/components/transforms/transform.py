@@ -50,7 +50,7 @@ def transform_compose(header,
                       flip_x, 
                       flip_y, 
                       angle, 
-                      random_order=False):
+                      random_order):
   """ Shape transform wrapper by fore-matmul all transformation 
   """
   # shear transformation
@@ -165,19 +165,19 @@ def random_augment(generator, header,
     scale_x = generator.uniform(scale_range[0], scale_range[1], size=sample_size)
     scale_y = generator.uniform(scale_range[0], scale_range[1], size=sample_size)
     order = generator.choice([True, False], p=[shuffle_ratio, 1 - shuffle_ratio], size=sample_size)
-    for i in tqdm.tqdm(range(sample_size), desc="Composing deformation"):
+    for i in tqdm.tqdm(range(sample_size), desc="Composing deformation", leave=False):
         if compile is False:
-            augments.append((header, shear_x[i], shear_y[i], scale_x[i], scale_y[i], flip_x[i], flip_y[i], rotate[i]))
+            augments.append((header, shear_x[i], shear_y[i], scale_x[i], scale_y[i], flip_x[i], flip_y[i], rotate[i], order[i]))
         else: 
-            augments[i] = dict(zip(['forward', 'size'], transform_compose(shear_x=shear_x[i], 
-                                                        shear_y=shear_y[i], 
-                                                        scale_x=scale_x[i], 
-                                                        scale_y=scale_y[i],
-                                                        flip_x=flip_x[i],
-                                                        flip_y=flip_y[i],
-                                                        angle=rotate[i],
-                                                        random_order=True,
-                                                        **header)))
+            augments[i] = dict(zip(['forward', 'size'], transform_compose(header=header,
+                                                                          shear_x=shear_x[i], 
+                                                                          shear_y=shear_y[i], 
+                                                                          scale_x=scale_x[i], 
+                                                                          scale_y=scale_y[i],
+                                                                          flip_x=flip_x[i],
+                                                                          flip_y=flip_y[i],
+                                                                          angle=rotate[i],
+                                                                          random_order=order[i])))
     return augments
 
 def transform(image, gnt, pts, header, aug, sample_size, num_workers=4):
@@ -206,6 +206,7 @@ def cut_centers_transform(image,
                           sample_size=512, 
                           pos_ratio=0.1, 
                           num_workers=4):
+    labels = None
     if profiles is None:
       augments = random_augment(gnt, header, sample_size=sample_size, **aug)
       augments = iter(augments)

@@ -1,0 +1,21 @@
+_target_:  src.data.components.river_dataset.RiverDataPool
+data_path: ${paths.data_dir}/v2
+train_path: ${paths.data_dir}/dataset/v2/train
+val_path: ${paths.data_dir}/dataset/v2/val
+seed: 12
+sample_size: 512
+label_ratio: 0.8
+patch_size: [512, 512]
+temporal: False
+augment:
+  shear_range: 0.5
+  rotate_range: 3.14
+  scale_range: 0.3
+  flip_ratio: 0.5
+  shuffle_ratio: 0.5
+val_center: null
+val_ratio: 0.1
+checkpoint_path: null
+max_samples_per_class: null
+num_workers: ${data.num_workers}
+deterministic: False

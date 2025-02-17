@@ -73,8 +73,8 @@ class RiverDataPool(Dataset):
         self.deterministic = deterministic
         self.fg_indices = None
         self.bg_indices = None
-        self.profiles = []
-        self.centers = []
+        self.profiles = None
+        self.centers = None
         self.labels = []
         self.setup(data_path, max_samples_per_class=max_samples_per_class)
     
@@ -190,10 +190,6 @@ class RiverDataPool(Dataset):
         header = {'h': self.patch_size[0], 'w': self.patch_size[1]}
         for idx, file in enumerate(tqdm.tqdm(self.files, desc="Generating training set")):
             year = file.split(".")[0]
-            if self.temporal:
-                if os.path.isdir(img_dir):
-                    subprocess.run(['rm', '-rf', img_dir])
-                os.mkdir(img_dir)
             
             image = cv2.imread(os.path.join(self.data_path, file), cv2.IMREAD_UNCHANGED)
             val_img_path =  os.path.join(self.val_path, f"{year}.png")
@@ -202,9 +198,7 @@ class RiverDataPool(Dataset):
             val_cfg.append(val_img_path)
             if self.temporal:
                 #(data, gnt, fg_indices, bg_indices, header, None, profiles=profiles, centers=centers)
-                profiles = self.profiles if self.deterministic else None
-                centers = self.centers if self.deterministic else None
-                patches, self.profiles, self.centers, self.labels = transform.cut_centers_transform(image, 
+                patches, self.profiles, self.centers, temp = transform.cut_centers_transform(image, 
                                                                             gnt=self.generator, 
                                                                             fg_indices=self.fg_indices, 
                                                                             bg_indices=self.bg_indices, 
@@ -214,6 +208,7 @@ class RiverDataPool(Dataset):
                                                                             centers=self.centers,
                                                                             pos_ratio=self.label_ratio,
                                                                             num_workers=self.num_workers)
+                self.labels = temp if temp is not None else self.labels
             else:
                 #(data, gnt, fg_indices, bg_indices, header, None, profiles=profiles, centers=centers)
                 profiles = self.profiles[idx] if self.deterministic else None
@@ -231,7 +226,8 @@ class RiverDataPool(Dataset):
                 self.profiles[idx] = profiles
                 self.centers[idx] = centers
                 self.labels[idx] = labels
-                                            
+
+
             for index, patch in enumerate(patches):
                 labels = self.labels if self.temporal else self.labels[idx]
                 id = index if self.temporal else self.sample_size * idx + index
@@ -256,7 +252,9 @@ class RiverDataPool(Dataset):
 
 
 class RiverDataset(Dataset):
-    def __init__(self, data_path, temporal=False, cfg = None):
+    def __init__(self,  data_path = None, 
+                        temporal = False, 
+                        cfg = None):
         self.data = []
         self.data_path = data_path
         self.temporal = temporal
@@ -268,7 +266,7 @@ class RiverDataset(Dataset):
     def setup(self, data_path, temporal=False):
         assert os.path.isdir(data_path)
         if not temporal:
-            self.data = sorted(os.listdir(data_path))
+            self.data = [os.path.join(data_path, file) for file in sorted(os.listdir(data_path))]
             return
 
         years = sorted(os.listdir(data_path))
@@ -277,17 +275,14 @@ class RiverDataset(Dataset):
         else:
             files = sorted(os.listdir(os.path.join(data_path, years[0])))
             self.data = [[os.path.join(data_path, year, file)for year in years] for file in files]
-    
-    def getitem(self, index: int):
-        if not isinstance(self.data[index], list):
-            self.data[index] = [self.data[index]]
-        return [cv2.imread(file, cv2.IMREAD_UNCHANGED) for file in self.data[index]]
 
-    def __getitem__(self, index: int | Sequence[int]):
-        if isinstance(index, int):
-            return [self.getitem(index)]
-        else: 
-            return [self.getitem(idx) for idx in index]
+    def __getitem__(self, index: int):
+        if isinstance(self.data[index], list):
+            # print(self.data[index])
+            labels = [1 if 'unsup' in file else 0 for file in self.data[index]]
+            return np.stack([cv2.imread(file, cv2.IMREAD_UNCHANGED) for file in self.data[index]], axis=0), labels
+        label = 1 if 'unsup' in self.data[index] else 0
+        return cv2.imread(self.data[index], cv2.IMREAD_UNCHANGED), [label]
 
     def __len__(self):
         return len(self.data)
@@ -312,26 +307,22 @@ class TransformedRiverDataset(Dataset):
     def __getitem__(self, idx):
         # image in PIL format, landmarks in image pixel coordinates
         # data = np.transpose(self.dataset[idx], axes=[0, 3, 1, 2])
-        data = self.dataset[idx]
+        data, labels = self.dataset[idx]
         # print(data[0][0].shape, np.unique(data[0][0][:, :, 3]))
-        inputs = []
-        hard_inputs = []
-        for sample in data: 
-            if self.dataset.temporal:
-                inputs.append(collate_batch([self.transform(image=dat[:, :, :3], mask=dat[:, :, [3]]) for dat in sample], 
-                                post_act=partial(torch.stack, dim=0)))
-                hard_inputs.append(collate_batch([self.hard_transform(image=dat[:, :, :3], mask=dat[:, :, [3]]) for dat in sample], 
-                                post_act=partial(torch.stack, dim=0)))
-            else: 
-                inputs += [self.transform(image=dat[:, :, :3], mask=dat[:, :, 3]) for dat in sample]
-                hard_inputs += [self.hard_transform(image=dat[:, :, :3], mask=dat[:, :, 3]) for dat in sample]
-        # Will allow pixelwise augmentation only
-        inputs = collate_batch(inputs, post_act=partial(torch.stack, dim=0))
-        hard_inputs = collate_batch(hard_inputs, post_act=partial(torch.stack, dim=0))
-        print(inputs['mask'].dtype, inputs['mask'].shape)
-        labels = torch.mean(inputs['mask'], dim=tuple(range(1, len(inputs['mask'].shape))))
-        inputs['label'] = torch.where(labels > 0.01, 1, 0)
-        inputs['hard'] = hard_inputs['image']
+        if self.dataset.temporal:
+            inputs = self.transform(volume=data[:, :, :, :3], masks=data[:, :, :, 3])
+            hard_inputs = self.hard_transform(volume=data[:, :, :, :3], masks=data[:, :, :, 3])
+        else:
+            inputs = self.transform(image = data[:, :, :3], mask=data[:, :, 3])
+            hard_inputs = self.hard_transform(image = data[:, :, :3], mask=data[:, :, 3])
+        # print(inputs['mask'].dtype, inputs['mask'].shape)
+        if self.dataset.temporal: 
+            inputs['image'] = inputs.pop('volume')
+            inputs['mask'] = inputs.pop('masks')
+            hard_inputs['mask'] = hard_inputs['masks']
+        print(torch.mean((inputs['mask'] - hard_inputs['mask']).float() ** 2))
+        inputs['label'] = torch.Tensor(labels).to(inputs['image'])
+        inputs['hard'] = hard_inputs.pop('image') if not self.dataset.temporal else hard_inputs.pop('volume')
         return inputs
 
 if __name__ == "__main__":
@@ -352,8 +343,11 @@ if __name__ == "__main__":
                             augment=augment,
                             temporal=temporal)
     train_cfg, val_cfg = pool.augment_crop()
+    print(train_cfg)
     temp = RiverDataset(train_path, temporal=temporal, cfg=train_cfg)
     dataset = TransformedRiverDataset(temp, None)
-    for index in range(len(dataset) - 3):
-        sample = dataset[index, index + 1, index + 2]
+    print(len(dataset))
+    export_path = root + "/viz"
+    for index in range(len(dataset)):
+        sample = dataset[index]
         print(sample.keys(), sample['mask'].shape, sample['image'].shape, sample['label'])

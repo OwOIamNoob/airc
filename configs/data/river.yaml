@@ -1,0 +1,11 @@
+_target_: src.data.river_datamodule.RiverDataModule
+
+defaults:
+  - pool: proj_256_256.yaml
+  - transform: intensity.yaml
+  - hard_transform: intensity.yaml
+
+seed: 12
+batch_size: 64
+num_workers: 4
+pin_memory: False
