@@ -1,0 +1,32 @@
+_target_: src.models.river_module.RiverLitModule
+
+defaults:
+  - net: unet
+
+optimizer:
+  _target_: torch.optim.Adam
+  _partial_: true
+  lr: 0.001
+  weight_decay: 0.00001
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+  _partial_: true
+  mode: min
+  factor: 0.01
+  patience: 10
+
+ema: 
+  _target_: src.utils.ema.LitEma
+  decay: 0.9999
+  use_num_updates: True
+  _partial_: True
+
+compile: False
+sw_batch_size: 4
+roi: ${data.pool.patch_size}
+infer_overlap: 0.5
+threshold: 0.5
+temporal: ${data.pool.temporal}
+semi_epoch: 10
+semi_weight: 0.3

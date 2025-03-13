@@ -172,7 +172,7 @@ class RiverDataPool(Dataset):
                 id = index if self.temporal else self.sample_size * idx + index
                 cv2.imwrite(os.path.join(img_dir, f"{id}.png"), cropped)
             
-    def augment_crop(self):
+    def augment_crop(self, skip_val: bool = False):
         assert os.path.isdir(self.train_path), "Output train folder is unrecognized"
         assert os.path.isdir(self.val_path), "Output valid folder not found"
         val_cfg = []
@@ -188,14 +188,16 @@ class RiverDataPool(Dataset):
         profiles, centers = None, None
         val_bbox = np.multiply(np.sqrt(self.val_ratio), self.spatial_size[:2]).astype(int)
         header = {'h': self.patch_size[0], 'w': self.patch_size[1]}
-        for idx, file in enumerate(tqdm.tqdm(self.files, desc="Generating training set")):
+        for idx, file in enumerate(tqdm.tqdm(self.files, desc="Generating training set", leave=False)):
             year = file.split(".")[0]
             
             image = cv2.imread(os.path.join(self.data_path, file), cv2.IMREAD_UNCHANGED)
-            val_img_path =  os.path.join(self.val_path, f"{year}.png")
-            cv2.imwrite(val_img_path, image[  max(0, self.val_center[0] - val_bbox[0]//2):min(self.spatial_size[0], self.val_center[0] + val_bbox[0]//2),
-                                                                            max(0, self.val_center[1] - val_bbox[1]//2):min(self.spatial_size[1], self.val_center[1] + val_bbox[1]//2)])
-            val_cfg.append(val_img_path)
+            if not skip_val:
+                val_img_path =  os.path.join(self.val_path, f"{year}.png")
+                cv2.imwrite(val_img_path, image[  max(0, self.val_center[0] - val_bbox[0]//2):min(self.spatial_size[0], self.val_center[0] + val_bbox[0]//2),
+                                                                                max(0, self.val_center[1] - val_bbox[1]//2):min(self.spatial_size[1], self.val_center[1] + val_bbox[1]//2)])
+                val_cfg.append(val_img_path)
+
             if self.temporal:
                 #(data, gnt, fg_indices, bg_indices, header, None, profiles=profiles, centers=centers)
                 patches, self.profiles, self.centers, temp = transform.cut_centers_transform(image, 
@@ -268,7 +270,6 @@ class RiverDataset(Dataset):
         if not temporal:
             self.data = [os.path.join(data_path, file) for file in sorted(os.listdir(data_path))]
             return
-
         years = sorted(os.listdir(data_path))
         if os.path.isfile(os.path.join(data_path, years[0])):
             self.data = [os.path.join(data_path, file) for file in years]
@@ -280,9 +281,10 @@ class RiverDataset(Dataset):
         if isinstance(self.data[index], list):
             # print(self.data[index])
             labels = [1 if 'unsup' in file else 0 for file in self.data[index]]
-            return np.stack([cv2.imread(file, cv2.IMREAD_UNCHANGED) for file in self.data[index]], axis=0), labels
+            filenames = [file.split("/")[-1] for file in self.data[index]]
+            return np.stack([cv2.imread(file, cv2.IMREAD_UNCHANGED) for file in self.data[index]], axis=0), labels, filenames
         label = 1 if 'unsup' in self.data[index] else 0
-        return cv2.imread(self.data[index], cv2.IMREAD_UNCHANGED), [label]
+        return cv2.imread(self.data[index], cv2.IMREAD_UNCHANGED), [label], self.data[index].split("/")[-1]
 
     def __len__(self):
         return len(self.data)
@@ -307,22 +309,23 @@ class TransformedRiverDataset(Dataset):
     def __getitem__(self, idx):
         # image in PIL format, landmarks in image pixel coordinates
         # data = np.transpose(self.dataset[idx], axes=[0, 3, 1, 2])
-        data, labels = self.dataset[idx]
+        data, labels, filenames = self.dataset[idx]
         # print(data[0][0].shape, np.unique(data[0][0][:, :, 3]))
         if self.dataset.temporal:
-            inputs = self.transform(volume=data[:, :, :, :3], masks=data[:, :, :, 3])
-            hard_inputs = self.hard_transform(volume=data[:, :, :, :3], masks=data[:, :, :, 3])
+            inputs = self.transform(images=data[:, :, :, :3], masks=data[:, :, :, 3])
+            hard_inputs = self.hard_transform(images=data[:, :, :, :3])
         else:
             inputs = self.transform(image = data[:, :, :3], mask=data[:, :, 3])
-            hard_inputs = self.hard_transform(image = data[:, :, :3], mask=data[:, :, 3])
+            hard_inputs = self.hard_transform(image = data[:, :, :3])
         # print(inputs['mask'].dtype, inputs['mask'].shape)
         if self.dataset.temporal: 
-            inputs['image'] = inputs.pop('volume')
+            inputs['image'] = inputs.pop('images')
             inputs['mask'] = inputs.pop('masks')
-            hard_inputs['mask'] = hard_inputs['masks']
-        print(torch.mean((inputs['mask'] - hard_inputs['mask']).float() ** 2))
-        inputs['label'] = torch.Tensor(labels).to(inputs['image'])
-        inputs['hard'] = hard_inputs.pop('image') if not self.dataset.temporal else hard_inputs.pop('volume')
+        # print(torch.mean((inputs['mask'] - hard_inputs['mask']).float() ** 2))
+        inputs['mask'] = inputs['mask'].float()
+        inputs['label'] = torch.Tensor(labels).to(inputs['image']).float()
+        inputs['hard'] = hard_inputs.pop('image') if not self.dataset.temporal else hard_inputs.pop('images')
+        inputs['filename'] = filenames
         return inputs
 
 if __name__ == "__main__":

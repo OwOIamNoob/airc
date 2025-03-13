@@ -92,15 +92,17 @@ class RiverDataModule(LightningDataModule):
     def setup(self, stage: Optional[str] = None) -> None:
         # load and split datasets only if not loaded already
         train_cfg, val_cfg = self.pool.augment_crop()
-        self.data_train = RiverDataset(cfg=train_cfg, temporal=self.pool.temporal)
-        self.data_val = RiverDataset(cfg=val_cfg, temporal=self.pool.temporal)
-        self.data_test = RiverDataset(cfg=val_cfg, temporal=self.pool.temporal)
+        if not self.data_val or not self.data_test or not self.data_train:
+            self.data_train = RiverDataset(cfg=train_cfg, temporal=self.pool.temporal)
+            self.data_val = RiverDataset(cfg=val_cfg, temporal=self.pool.temporal)
+            self.data_test = RiverDataset(cfg=val_cfg, temporal=self.pool.temporal)
 
     def train_dataloader(self) -> DataLoader[Any]:
         """Create and return the train dataloader.
 
         :return: The train dataloader.
         """
+        # self.data_train.data, _ = self.pool.augment_crop(skip_val=True)
         dataset = TransformedRiverDataset(self.data_train, transform=self.transform, hard_transform=self.hard_transform)
         return DataLoader(
             dataset=dataset,
@@ -118,7 +120,7 @@ class RiverDataModule(LightningDataModule):
         dataset = TransformedRiverDataset(self.data_val, transform=None, hard_transform=None)
         return DataLoader(
             dataset=dataset,
-            batch_size=self.batch_size_per_device,
+            batch_size=1,
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
@@ -131,7 +133,7 @@ class RiverDataModule(LightningDataModule):
         dataset = TransformedRiverDataset(self.data_val, transform=None)
         return DataLoader(
             dataset=dataset,
-            batch_size=self.batch_size_per_device,
+            batch_size=1,
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             shuffle=False,
@@ -177,6 +179,8 @@ if __name__ == "__main__":
         print(batch.keys(), 
                 batch['hard'].shape,
                 batch['image'].shape,
-                batch['mask'].shape)
+                batch['mask'].shape,
+                batch['label'].shape)
+        mean
     
     main()

@@ -2,9 +2,9 @@ _target_:  src.data.components.river_dataset.RiverDataPool
 data_path: ${paths.data_dir}/v2
 train_path: ${paths.data_dir}/dataset/v2/train
 val_path: ${paths.data_dir}/dataset/v2/val
-seed: 12
+seed: null
 sample_size: 512
-label_ratio: 0.8
+label_ratio: 0.7
 patch_size: [512, 512]
 temporal: False
 augment:
@@ -17,5 +17,5 @@ val_center: null
 val_ratio: 0.1
 checkpoint_path: null
 max_samples_per_class: null
-num_workers: ${data.num_workers}
+num_workers: 4
 deterministic: False

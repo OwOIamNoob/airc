@@ -1,0 +1,5 @@
+wandb_river:
+  _target_: src.utils.callback.WandbCallback
+  mean: [0.485, 0.456, 0.406]
+  var:  [0.229, 0.224, 0.225]
+  log_spatial_size: [480, 640]
