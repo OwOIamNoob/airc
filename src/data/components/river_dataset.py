@@ -116,6 +116,7 @@ class RiverDataPool(Dataset):
         if self.bg_indices is None or self.fg_indices is None:
             mask = None
             for file in tqdm.tqdm(self.files, desc="Examining label:"):
+                print(file)
                 data = cv2.imread(os.path.join(self.data_path, file), cv2.IMREAD_UNCHANGED)
                 if mask is None:
                     mask = np.zeros_like(data[:, :, 3])

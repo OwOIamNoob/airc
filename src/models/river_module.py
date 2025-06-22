@@ -7,7 +7,7 @@ from torch import nn
 import torch.nn.functional as F
 from lightning import LightningModule
 from torchmetrics import MaxMetric, MeanMetric
-from torchmetrics import Dice
+from torchmetrics.segmentation import DiceScore
 from torch.cuda.amp import GradScaler, autocast
 
 from monai.inferers import sliding_window_inference
@@ -44,6 +44,7 @@ def structured_loss(logits, tgt, sequential=False):
     dice_loss = 1 - 2 * intersection / summation
     bce_loss = F.binary_cross_entropy_with_logits(logits.squeeze(1), tgt,
                                                 reduction='none').mean(dim=reduce_dim)
+    print(dice_loss, bce_loss)
     return 0.5 * dice_loss + 0.5 * bce_loss
 
 def semi_loss(logits, teacher_logits, tgt, labels, sequential=False, weight = 0.1):
@@ -144,9 +145,8 @@ class RiverLitModule(LightningModule):
                                     sequential=temporal)
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
         
-        self.metric = Dice(threshold=threshold, 
-                            average='micro', 
-                            zero_division=0)
+        self.metric = DiceMetric(include_background=False, reduction="mean", get_not_nans=True)
+
         # counter for semi-supervised
         self.epoch = 0
 
@@ -282,9 +282,12 @@ class RiverLitModule(LightningModule):
         # print(len(val_output_convert), [tensor.shape for tensor in val_output_convert])
         # Metric computations
         # print(logits.shape, target.shape)
-        metrics = [self.metric(pred, tgt.int()) for pred, tgt in zip(val_output_convert, val_labels_list)]
+        for pred, tgt in zip(val_output_convert, val_labels_list):
+            print(pred.shape, tgt.shape)
+        metrics = [self.metric(pred, tgt.int().unsqueeze_(0)) for pred, tgt in zip(val_output_convert, val_labels_list)]
+        metrics = torch.where(torch.isnan(metrics[0]), 0, metrics)
         loss = structured_loss(logits, target, sequential=self.hparams.temporal)
-        print(loss, metrics)
+        print(loss, metrics, torch.unique(val_labels_list[0]))
         self.val_loss.update(loss, data.size(0))
         self.val_dice.update(metrics, data.size(0))
         self.log("val/loss", loss.mean(), on_step=False, on_epoch=True, prog_bar=True)

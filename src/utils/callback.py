@@ -21,7 +21,6 @@ from matplotlib import pyplot as plt
 from matplotlib import cm
 from matplotlib.colors import Normalize
 import wandb
-import nibabel as nib
 
 
 class WandbCallback(Callback):

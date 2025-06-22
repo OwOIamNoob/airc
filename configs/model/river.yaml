@@ -28,5 +28,5 @@ roi: ${data.pool.patch_size}
 infer_overlap: 0.5
 threshold: 0.5
 temporal: ${data.pool.temporal}
-semi_epoch: 10
-semi_weight: 0.3
+semi_epoch: 100
+semi_weight: 0
