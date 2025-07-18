@@ -12,6 +12,7 @@ def negative_field(logit_map, distance=15, beta=0.5, alpha=0.05):
     negative_field = dilated_mask - dilated_mask * dilated_possible
     return negative_field
 
+
 def grid_sampling(mask, grid=8, alpha=0.1):
     if isinstance(grid, int):
         grid = (grid, grid)
