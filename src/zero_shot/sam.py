@@ -281,13 +281,13 @@ class SamInferer:
 
     
     def gather_prompts(self, src):
-        def filter(src, min_dis=50):
-            dis = np.linalg.norm(src[:, None, :] - src[None, :, :], axis=2)
+        def filter(pts, min_dis=50):
+            dis = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
             valid = np.triu(np.ones_like(dis), k=1)
             dis[valid==0] = 1e5
             s = (dis < min_dis).sum(axis=0)
             print(dis, s)
-            return src[s == 0]
+            return pts[s == 0].copy()
         res = []
         index = 0
         if len(self.queue) > 0:
