@@ -17,6 +17,14 @@ import scipy
 import skimage
 import src.zero_shot.utils as utils
 
+MODEL_NAME = {
+    "tiny": "sam2.1_hiera_tiny",
+    "small": "sam2.1_hiera_small",
+    "base": "sam2.1_hiera_base_plus",
+    "large": "sam2.1_hiera_large"
+}
+
+
 crop = lambda image, centroid, patch_size: image[centroid[0] - patch_size[0] // 2: centroid + patch_size[0] // 2, 
                                                     centroid[1] - patch_size[1] // 2: centroid + patch_size[1] // 2]
 def eval(pred, label):
@@ -24,6 +32,9 @@ def eval(pred, label):
     intersection = pred * label
     int_count = intersection.sum()
     union = cv2.bitwise_or(pred, label)
+    fp = (1 - pred) * ( 1- label)
+    fpr, tpr = fp.sum() / (1 - label).sum(), int_count / label.sum()
+
     u_count = union.sum()
     dice = 2 * int_count / (int_count + u_count + 1e-6)
     iou = int_count / u_count 
@@ -34,7 +45,9 @@ def eval(pred, label):
             'iou': iou,
             'acc': acc,
             'recall': recall,
-            'f1': f1}
+            'f1': f1,
+            'fpr': fpr,
+            'tpr': tpr}
 
 # A wrapper for Sam inference
 class SamInferer:
@@ -142,6 +155,11 @@ class SamInferer:
     
     def reset(self):
         self.step = 0
+        self.queue = []
+        self.pos = np.zeros([0, 2], dtype=int)
+        self.neg = np.zeros([0, 2], dtype=int)
+        self.neg_seg = None
+        
         self.a_mask = None
         self.b_mask = None
         self.image = None 
@@ -161,10 +179,10 @@ class SamInferer:
 
     def pop(self):
         if len(self.queue) == 0:
-            print("Empty queue !!!")
+            # print("Empty queue !!!")
             return None
         (score, item) = self.queue.pop(0)
-        print(f"Candidate of score {score}")
+        # print(f"Candidate of score {score}")
         return item
             
     def valid_pts(self, pts):
@@ -190,9 +208,6 @@ class SamInferer:
         # Must be in xy format
         return np.concatenate([valid_pos, valid_neg], axis=0)[:, ::-1].copy(), np.concatenate([pos_label, neg_label], axis=0)
 
-    def set_marker(self, mask): 
-        self.marker = utils.smooth_mask(mask, 15, 5.)
-    
     def read(self, image_path, channels=3):
         img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
         
@@ -286,22 +301,24 @@ class SamInferer:
             valid = np.triu(np.ones_like(dis), k=1)
             dis[valid==0] = 1e5
             s = (dis < min_dis).sum(axis=0)
-            print(dis, s)
+            # print(dis, s)
             return pts[s == 0].copy()
         res = []
         index = 0
         if len(self.queue) > 0:
             while index < len(self.queue):
-                (score, item) = self.queue[index]
+                (_, prompt) = self.queue[index]
+                item = prompt['pt']
                 dis = np.abs(src - item)
                 pos = item - self.root
                 if (dis > self.pos_rad).any() or ((pos >= self.patch_size) | (pos < 0)).any() or self.hist[item[0], item[1]] < self.pos_sc: 
                     index += 1
                 else:
-                    res.append(self.queue.pop(index))
-            res = [src.copy()] + [coord for s, coord in res]
+                    res.append(self.queue.pop(index)[1]['pt'])
+            res = [src.copy()] + res
+            # print("Res:", res)
             res = filter(np.array(res), min_dis=self.pos_dis)
-            print(f"Gathered {res.shape[0] - 1} prompts in single batch")
+            # print(f"Gathered {res.shape[0] - 1} prompts in single batch")
             if len(res) == 1:
                 return np.ones([0, 2])
             return res[1:self.topk]
@@ -309,12 +326,17 @@ class SamInferer:
             return np.ones([0, 2])
         
     def infer(self, debug=False):
-        prompt = self.pop()
+        nested_prompt = self.pop()
+        prompt = nested_prompt['pt'].copy()
         if prompt is None:
             return {'ret': False}
         if self.hist[prompt[0], prompt[1]] >= self.patience * 2:
-            print(f"Point {prompt} got inferred {self.hist[prompt[0], prompt[1]]} times, skipping")
+            # print(f"Point {prompt} got inferred {self.hist[prompt[0], prompt[1]]} times, skipping")
             return {'ret': False}
+        if self.marker is not None: 
+            if self.marker[prompt[0], prompt[1]] == 0: 
+                return {'ret': False}
+            
         x, y, _, _ = utils.get_bbox(self.box, prompt, self.patch_size)
         self.roi_(x, y)
         # Change base for referencing and post-processing.
@@ -327,25 +349,35 @@ class SamInferer:
         if (graph_root * (graph_root - self.patch_size)  <= 0).all(): 
             root_di = self.patch_size / 2 - graph_root
             root_di /= (np.linalg.norm(root_di) + 1e-4)
-            print("Prompt presents in the patch")
+            # print("Prompt presents in the patch")
             base_root['point'] =  np.concatenate([base_root['point'], graph_root], axis=0)
             base_root['direction'] = np.concatenate([base_root['direction'], root_di], axis=0)
         # Image in RGB format
         patch = self.image[self.root[0]:dst[0], self.root[1]:dst[1]].copy()
         self.predictor.set_image(patch)
         # Positional Preparation
-        input_mask = self.b_mask[self.root[0]:dst[0], self.root[1]:dst[1]].copy()
+        input_mask = skimage.morphology.erosion(self.b_mask[self.root[0]:dst[0], self.root[1]:dst[1]].copy())
         # input_mask = 0
-        input_mask = np.maximum(input_mask, self.traits[self.root[0]:dst[0], self.root[1]:dst[1]] * (1 - scipy.ndimage.binary_fill_holes(input_mask)))
+        if 'branch' in nested_prompt.keys():
+            available = 1 - scipy.ndimage.binary_fill_holes(input_mask).astype(np.uint8)
+            path_map = np.zeros_like(input_mask)
+            pts = nested_prompt['branch'] - self.root
+            valid = (pts[:, 0] >= 0) & (pts[:, 0] < self.patch_size[0]) & (pts[:, 1] >= 0) & (pts[:, 1] < self.patch_size[1])
+            pts = pts[valid, :]
+            # print("Branch in the prompt", pts.shape)
+            path_map[pts[:, 0], pts[:, 1]] = 1
+            self.hist[self.root[0]: dst[0], self.root[1]:dst[1]] += cv2.dilate(path_map, self.fill_kernel, iterations=10) * self.w_kernel * 2
+            path_map *= available
+            input_mask = np.maximum(input_mask, path_map)
         input_mask = cv2.resize(input_mask.astype(np.uint8), (256, 256))
         pos = np.concatenate([np.array(prompt)[None, :], self.gather_prompts(prompt)], axis=0).astype(int)
-        print("Prompts:", pos)
+        # print("Prompts:", pos)
         base_root['point'] = np.concatenate([base_root['point'], pos - self.root[None, :]], axis=0)
         base_root['direction'] = np.concatenate([base_root['direction'], np.zeros([pos.shape[0], 2])], axis=0)
         neg = self.negative_sampling(pos, debug=debug)
         annotation, a_label = self.compose_prompts(pos, neg['pts'])
         # Mind that mask input must halve the size, for size matching
-        print(input_mask.shape, a_label.shape, annotation.shape )
+        # print(input_mask.shape, a_label.shape, annotation.shape)
         masks, scores, logits = self.predictor.predict(point_coords=annotation, 
                                                         point_labels=a_label, 
                                                         mask_input=input_mask[None, :] if input_mask.max() > 0 else None, 
@@ -359,7 +391,7 @@ class SamInferer:
                 'logit': cv2.resize(cv2.GaussianBlur(logits[0], (3, 3), 0), self.patch_size, interpolation=cv2.INTER_LINEAR), 
                 'pts': annotation, 
                 'label': a_label,
-                'inp_mask': self.b_mask[self.root[0]: dst[0], self.root[1]:dst[1]].copy(),
+                'inp_mask': cv2.resize(input_mask, self.patch_size),
                 'prompt': prompt,
                 'negative': neg}
     
@@ -389,10 +421,10 @@ class SamInferer:
                 'mask': out_seg}
 
     def graph_search(self, w_map, graph_root, mask, b_mask=None):
-        print("Searching")
+        # print("Searching")
         dst = self.root + self.patch_size
         w_pts = np.array(np.where((w_map > 0) * (w_map < 5))).T
-        print("Skeleton size:", w_pts.shape[0])
+        # print("Skeleton size:", w_pts.shape[0])
         if w_pts.shape[0] > 4000:
             return False, None, None
         
@@ -413,8 +445,8 @@ class SamInferer:
         # unilateral_dfs_tree(g_mask, inp_mask, start, weight = 1, alpha=0.1, thresh=0.95, context_size=3, dis_map=None)
         # Ordering from leaves to roots
         self.dis_map[self.root[0]: dst[0], self.root[1]:dst[1]] = (self.dis_map[self.root[0]: dst[0], self.root[1]:dst[1]] + scipy.ndimage.gaussian_filter(tree['dis_map'], [5., 5., 0])) / 2
-        print("Maximal outtro and intro:", tree['status'].max())
-        self.traits[self.root[0]: dst[0], self.root[1]:dst[1]] = np.maximum(self.traits[self.root[0]: dst[0], self.root[1]:dst[1]], tree['status'] >= max(0, tree['status'].max() - 4))
+        # print("Maximal outtro and intro:", tree['status'].max())
+        # self.traits[self.root[0]: dst[0], self.root[1]:dst[1]] = np.maximum(self.traits[self.root[0]: dst[0], self.root[1]:dst[1]], tree['status'] >= max(0, tree['status'].max() - 4))
         cost_map = tree['cost']
         branches = utils.longest_path_branching(tree['dfs_tree'], tuple(nn), dead=tree['dead'])
         valid_branches = [branches[i] for i in range(len(branches)) if len(branches[i]) >= self.min_length]
@@ -430,27 +462,29 @@ class SamInferer:
             return seg_res
         dst = self.root + self.patch_size
         # Updating primitives
-        print(self.patch_size, seg_res['mask'].shape, seg_res['mask'].dtype)
+        # print(self.patch_size, seg_res['mask'].shape, seg_res['mask'].dtype)
         # Never let it lower than alpha
         score = max(seg_res['score'], self.alpha) 
         if score < self.alpha:
             warnings.warn(f"Model confidence {score} is hazardous, please make prompt to escape uncertainty")
-        print(f"Score {score}")
-        print(f"With {seg_res['label'].sum()} positives and {seg_res['label'].shape[0] - seg_res['label'].sum()} negatives")
+        # print(f"Score {score}")
+        # print(f"With {seg_res['label'].sum()} positives and {seg_res['label'].shape[0] - seg_res['label'].sum()} negatives")
         # Clean background from static gain
         prob_map = utils.sigmoid(seg_res['logit'])
         # Model was trained to get threshold at 0.5 intuitively
         if (prob_map >= self.alpha).sum() < self.root_area: 
             return {'ret': False}
-        sv = [0, 
-              self.alpha / 2, 
-              np.quantile(prob_map[prob_map >= self.alpha], 0.2), 
-              np.quantile(prob_map[prob_map >= self.alpha], 0.5), 
-              1]
-        dv = [0, 0, self.alpha * 0.8 + 0.2, self.alpha * 0.5 + 0.5, 1]
+        # sv = [0, 
+        #       self.alpha / 2, 
+        #       np.quantile(prob_map[prob_map >= self.alpha], 0.2), 
+        #       np.quantile(prob_map[prob_map >= self.alpha], 0.5), 
+        #       1]
+        # dv = [0, 0, self.alpha * 0.8 + 0.2, self.alpha * 0.5 + 0.5, 1]
+        sv, dv = [0, 1], [0, 1]
         # print(sv, dv)
         if self.post_act:
             normed_map = scipy.ndimage.gaussian_filter(np.interp(prob_map, sv, dv), sigma=0.5) 
+            # normed_map = prob_map
         else:
             normed_map = np.where(np.abs(seg_res['logit']) > 10, np.sign(seg_res['logit']) * 10, seg_res['logit'])
         normed_prob_map = normed_map if self.post_act is True else utils.sigmoid(normed_map)
@@ -466,7 +500,7 @@ class SamInferer:
         prev_var = self.var[self.root[0]: dst[0], self.root[1]:dst[1]].copy()
         # Update variance with momentum
         if (normed_prob_map > self.beta).sum() <= self.root_area:
-            print("Segmentation mask is self contained, skipping")
+            # print("Segmentation mask is self contained, skipping")
             return {'ret': False, 'infer': seg_res, 'logit': normed_map, 'prob': normed_prob_map}
         max_dev = 1 if self.post_act is True else min(5, max(2, -np.quantile(-seg_res['logit'], 0.0005) - np.quantile(seg_res['logit'], 0.05))) / 2
         self.var[self.root[0]: dst[0], self.root[1]:dst[1]] = (1 - ensemble_kernel) * self.var[self.root[0]: dst[0], self.root[1]:dst[1]] + ensemble_kernel * np.minimum((normed_map - prev) ** 2, ( 0.3 * max_dev ) ** 2)
@@ -475,7 +509,7 @@ class SamInferer:
         true =  prev_prob > self.alpha
         positive = normed_prob_map > self.alpha
         # print(true.mean(), positive.mean())
-        roi = true | positive
+        roi = skimage.morphology.binary_dilation(true | positive, footprint=np.ones([5, 5], dtype=np.uint8))
         dev = (self.var[self.root[0]: dst[0], self.root[1]:dst[1]] ** 0.5)[roi].mean()
         liou = ((true & positive).sum() + 1) / (true.sum() + 1)
         # print(dev.shape, beta.shape, prob_map.shape)
@@ -484,6 +518,7 @@ class SamInferer:
         # confidence = np.where(offset < 0, 1 - confidence, confidence)
         unstable = np.abs(confidence - 0.5) >= (self.confidence / 2) 
         stable = (prev_var < 0.05 * max_dev) & (self.weight[self.root[0]: dst[0], self.root[1]:dst[1]] >= self.confidence * self.stable_weight) & roi
+        stable = stable | (seg_res['inp_mask'] > 0)
         # If the overlap is too shallow, preserves the ensemble output
         if liou < 0.5:
             tn = true & ~positive 
@@ -511,7 +546,7 @@ class SamInferer:
         else:
             prob_dev = dev
         prob_map = prob_map ** self.gamma
-        print(f"Alpha adaptive threshold {- int(self.alpha * prob_dev * 255)}")
+        # print(f"Alpha adaptive threshold {- int(self.alpha * prob_dev * 255)}")
         # Discretized Probabilistic Map
         # beta = self.beta[self.root[0]: dst[0], self.root[1]:dst[1]] / self.weight[self.root[0]: dst[0], self.root[1]:dst[1]]
         # beta = (scipy.ndimage.gaussian_filter(beta, 2.) * 255).astype(np.uint8)
@@ -523,12 +558,15 @@ class SamInferer:
         # possible -= possible * self.b_mask[root[0]: dst[0], root[1]:dst[1]]
         # possible = scipy.ndimage.binary_fill_holes(possible).astype(np.uint8)  * (1 - holes)
         # Get possible
-        
+        window_size = max(self.patch_size) // self.neg_sampling_grid
+        window_size += window_size % 2 - 1
+        dilated_window_size = int(float(window_size) * 1.3) 
+        dilated_window_size += dilated_window_size % 2 - 1
         discrete = cv2.adaptiveThreshold(quantized_conf, 
                                             1, 
                                             cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                             cv2.THRESH_BINARY, 
-                                            91, 
+                                            window_size, 
                                             - max(15, int(self.confidence * prob_dev * 255)))
         beta_mask = beta_mask + (1 - beta_mask) * discrete
         holes = scipy.ndimage.binary_fill_holes(beta_mask) - beta_mask
@@ -537,12 +575,12 @@ class SamInferer:
                                             1, 
                                             cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                             cv2.THRESH_BINARY, 
-                                            91, 
+                                            dilated_window_size, 
                                             - max(5, int(self.d_alpha * prob_dev * 255))) * (quantized_conf >= self.alpha * 255)
         possible = possible + (1 - possible) * beta_mask
         # Process 
-        possible = utils.prune(possible, min_size=100)
-        possible = scipy.ndimage.binary_closing(possible, iterations=2).astype(np.uint8)
+        possible = utils.prune(possible, min_size=self.root_area)
+        # possible = scipy.ndimage.binary_closing(possible, iterations=2).astype(np.uint8)
         possible = utils.smooth_mask(possible, 5, 1.5) * (1 - holes)
         
         if self.marker is not None: 
@@ -558,20 +596,20 @@ class SamInferer:
         
         # Stabilize skeleton
         thin, thin_w = utils.morphology_thinning(possible, return_weight=True)
-        print("Thin:", possible.shape, thin_w.shape, thin.shape, possible.max())
-        thin_w = scipy.ndimage.grey_dilation(thin_w, size=5)
+        # print("Thin:", possible.shape, thin_w.shape, thin.shape, possible.max())
+        thin_w = scipy.ndimage.grey_dilation(thin_w, size=3)
         stable = scipy.ndimage.grey_closing(thin_w + self.atlas[self.root[0]: dst[0],self.root[1]:dst[1]], 
-                                            size=10)
+                                            size=5)
         stable = utils.prune(stable, min_size=10) * stable
         
         skeleton = skimage.morphology.skeletonize(stable)
         stable = stable.astype(float)
         stable = stable / (stable[stable > 0].mean() + 1e-3)
         stable[stable == 0] = 1e2 
-        print("Stable:", stable.shape, "Skeleton values:", np.unique(skeleton))
+        # print("Stable:", stable.shape, "Skeleton values:", np.unique(skeleton))
         # skeleton = getLargestCC(skeleton).astype(int).astype(np.uint8)
         # Flow map generation output['dist']
-        print(score, skeleton.shape, prob_map.shape)
+        # print(score, skeleton.shape, prob_map.shape)
         w_map =  skeleton.astype(float) * ((1 - quantized_conf.astype(float) / 255) * (stable + 1e-1) + 1e-1) 
         
         # w_map /= w_map.max()
@@ -579,7 +617,7 @@ class SamInferer:
         w_map[w_map > 5] = 5 
         w_map /= 5
         w_map[~skeleton] = 1e5
-        print("Weight map",  w_map.max(), w_map.min())
+        # print("Weight map",  w_map.max(), w_map.min())
         # save_gray("/work/hpc/potato/airc/data/vis/debug.jpg", w_map, 'viridis')
         # Update root to center of mass
         ref_mask = possible.copy()
@@ -590,16 +628,18 @@ class SamInferer:
         direction = []
         for i, root in enumerate(graph_root['point']):
             # print(root)
+            root = np.array([max(0, min(sz, item)) for sz, item in zip(self.patch_size, root)], dtype=int)
             if (acp_mask[root[0], root[1]] == 1) or (ref_mask[root[0], root[1]] == 0):
                 continue
             roots.append(root)
             try:
                 direction.append(graph_root['direction'][i]) 
             except:
-                print(f"Graph mismatch {len(graph_root['point'])} and {len(graph_root['direction'])}")
+                pass
+                # print(f"Graph mismatch {len(graph_root['point'])} and {len(graph_root['direction'])}")
             # print(direction)
             temp = skimage.segmentation.flood(ref_mask, tuple(root.tolist()))
-            print(f"Component at {root} coverage: {temp.mean()}")
+            # print(f"Component at {root} coverage: {temp.mean()}")
             # ref_mask[temp > 0] = 0
             acp_mask = np.maximum(acp_mask, temp)
         # Flag all inferences
@@ -609,9 +649,9 @@ class SamInferer:
             cc_centers = self.morphology_centers(remains, 
                                                  self.weight[self.root[0]: dst[0], self.root[1]:dst[1]], 
                                                  minArea=self.root_area)
-            print("CC max value:", cc_centers['mask'].max())
+            # print("CC max value:", cc_centers['mask'].max())
         else:
-            print("Cluster is empty")
+            # print("Cluster is empty")
             cc_centers = {'centers': np.zeros([0, 2]), 'mask': np.zeros([0, 2])}
         roots = np.concatenate([np.array(roots).reshape(-1, 2), cc_centers['centers']], axis=0).astype(int)
         direction = np.pad(np.array(direction).reshape(-1, 2), ((0, cc_centers['centers'].shape[0]), (0, 0)), mode='constant')
@@ -649,12 +689,12 @@ class SamInferer:
                     if confidence[x, y] > self.alpha:
                         # if state_map[x, y] == 1 or state_map[x, y] % 2 == 0:
                         break
-                        
+                # print(branch[:10])
                 for index, j in enumerate(range(i, max(i + 1, len(branch) - self.min_length), self.sampling_dis)):
                     x, y = branch[j]
                     score = prob_map[x, y] * (1000 - (len(branch) - j)) * cost * self.w_kernel[x, y]
-                    print(f"Candidate {j} or length {len(branch)}: ", self.root + branch[j], score)
-                    self.add_queue(self.root + branch[j], prior = score)
+                    # print(f"Candidate {j} or length {len(branch)}: ", self.root + branch[j], score)
+                    self.add_queue(prompt={'pt':self.root + branch[j], 'branch': self.root + np.array(branch)}, prior = score)
                 
                 # Only get outgoing vertexes, 
                 # if it loops into the main stream
@@ -664,17 +704,9 @@ class SamInferer:
                 # else: 
                 #     print("Point in mask already")
                 # Draw on canvas for mask extraction later
-                for node in branch[i:]:
-                    # canvas[node[0], node[1]] = thin_w[node[0], node[1]]
-                    canvas[node[0], node[1]] = 1
-        
-        result_mask[((1 - scipy.ndimage.binary_fill_holes(beta_mask)) * canvas) > 0] = 1
-        
-        print(result_mask.max(), self.b_mask[self.root[0]: dst[0], self.root[1]:dst[1]].max(), beta_mask.max())
+        # print(result_mask.max(), self.b_mask[self.root[0]: dst[0], self.root[1]:dst[1]].max(), beta_mask.max())
         self.b_mask[self.root[0]: dst[0], self.root[1]:dst[1]] = np.maximum(self.b_mask[self.root[0]: dst[0], self.root[1]:dst[1]], result_mask)
         # self.b_mask[self.root[0]: dst[0], self.root[1]:dst[1]][unstable] = result_mask[unstable].copy()
-        print(weight.max(), score, result_mask.max())
-        self.hist[self.root[0]: dst[0], self.root[1]:dst[1]] += cv2.dilate(result_mask, self.fill_kernel, iterations=2) * self.w_kernel * 2
         self.atlas[self.root[0]: dst[0], self.root[1]:dst[1]] = np.maximum(self.atlas[self.root[0]: dst[0], self.root[1]:dst[1]], canvas)
         metrics = eval(self.b_mask[self.root[0]: dst[0], self.root[1]:dst[1]].copy(), self.label[self.root[0]: dst[0], self.root[1]:dst[1]])
 
@@ -713,29 +745,24 @@ class SamInferer:
     def check_hist(self, pt):
         return self.hist[pt[0], pt[1]] > self.patience
     
-    def add_queue(self, pt: list, prior: float = 1, isroot: bool =False):
+    def add_queue(self, prompt, prior: float = 1, isroot: bool =False):
         if isroot:
             # self.pos = np.concatenate([self.pos, np.array([pt])], axis=0)
             # self.queue.put((prior, pt))
-            heappush(self.queue, (prior, pt))
-            self.graph_root = np.array(pt)[None, :]
+            heappush(self.queue, (prior, prompt))
+            self.graph_root = np.array(prompt['pt'])[None, :]
             return 
-        
+        pt = prompt['pt']
         if self.check_hist(pt): 
-            print(f"Same position got infered for {self.hist[pt[0], pt[1]]} times, skipping {pt}")
+            # print(f"Same position got infered for {self.hist[pt[0], pt[1]]} times, skipping {pt}")
             return
-            
-        # if pt[0] < 300:
-        #     print(f"{pt} goes out of ROI")
-        #     return
-            
         score = max(1, int(prior + self.step))
-        entry = (score, pt)
+        entry = (score, prompt)
         try:
             # self.queue.put(entry)
             self.queue.append(entry)
             self.queue = sorted(self.queue, key=lambda x: x[0])
-            print(self.queue)
+            # print(self.queue)
         except Exception as error:
             print(error)
             pass
