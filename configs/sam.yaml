@@ -7,4 +7,5 @@ model:
   post_act: False
 prompt: [565, 1655]
 log_size: [128, 128]
-output_dir: ${paths.root_dir}/outputs/prob_${now:%Y-%m-%d}_${now:%H-%M-%S}
+inspect: [[1877, 834, 0], [2072, 1838, 0], [507, 3659, 0], [1120, 4982, 0], [2766, 5781, 0]]
+output_dir: ${paths.root_dir}/paper_outputs/prob_${now:%Y-%m-%d}_${now:%H-%M-%S}

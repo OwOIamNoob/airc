@@ -1,0 +1,38 @@
+roi: 
+ - 256
+ - 256
+patch_size: 
+ - 512
+ - 512
+
+# Positive sampling config
+pos_dis: 30
+pos_rad: 200
+pos_sc: 2.
+
+# Negative sampling config 
+neg_dis: 20
+neg_sampling_grid: 6
+
+# Ensemble config
+confidence: 0.8
+post_act: False
+stable_weight: 2.
+decay: 0.5
+
+# Thresholding Config
+gamma: 1.5
+beta: 0.7
+d_alpha: 0.1
+alpha: 0.25
+
+# Traits config
+thresh: 0.95
+fill_kernel_size: 5
+min_length: 100 
+sampling_dis: 300 
+back_off: 20
+patience: 2
+root_area: 800
+topk: 2
+label_bins: []

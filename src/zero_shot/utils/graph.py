@@ -50,7 +50,7 @@ def unilateral_dfs_tree(g_mask, inp_mask, start, b_mask = None, alpha=0.1, thres
             di_state = np.concatenate([moves, np.array([(dx, dy)])], axis=0)
             
             nx, ny = x + dx, y + dy
-            if ((nx - h) * nx >= 0) or ((ny - w) * ny >= 0):
+            if ((nx - h) * nx > 0) or ((ny - w) * ny > 0):
                 continue
             
             if 0 <= nx < rows and 0 <= ny < cols and g_mask[nx, ny] > alpha and status[nx, ny] <= status[x, y]:

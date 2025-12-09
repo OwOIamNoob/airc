@@ -9,6 +9,7 @@ import torch
 import sam2
 from sam2.build_sam import build_sam2, build_sam2_hf
 from sam2.sam2_image_predictor import SAM2ImagePredictor as SAM
+import matplotlib.pyplot as plt
 
 import cv2
 import numpy as np
@@ -24,30 +25,36 @@ MODEL_NAME = {
     "large": "sam2.1_hiera_large"
 }
 
-
+clip = lambda x, low=0, high=1: max(low, min(high, x))
 crop = lambda image, centroid, patch_size: image[centroid[0] - patch_size[0] // 2: centroid + patch_size[0] // 2, 
                                                     centroid[1] - patch_size[1] // 2: centroid + patch_size[1] // 2]
+def roc(pred, label):
+    tpr = (pred * label).sum() / label.sum()
+    fpr = (pred * ( 1- label)).sum() / (1- label).sum()
+    return [fpr, tpr]
+ 
+def roc_curve(logit, label, step=20): 
+    curve = np.array([roc(logit >= threshold, label) for threshold in np.linspace(0, 1, num=step)])
+    curve = curve[curve[:, 0].argsort()]
+    return curve
+
 def eval(pred, label):
+    false_region = cv2.dilate(label, np.ones([3, 3], dtype=np.uint8), iterations=10) - label 
     total = label.shape[0] * label.shape[1]
     intersection = pred * label
     int_count = intersection.sum()
     union = cv2.bitwise_or(pred, label)
-    fp = (1 - pred) * ( 1- label)
-    fpr, tpr = fp.sum() / (1 - label).sum(), int_count / label.sum()
-
     u_count = union.sum()
-    dice = 2 * int_count / (int_count + u_count + 1e-6)
-    iou = int_count / u_count 
+    dice = 2 * int_count / (int_count + u_count + 1)
+    iou = int_count / (u_count + 1) 
     acc = (pred == label).sum() / total
-    recall = int_count / pred.sum()
-    f1 = 2 * acc * recall / (acc + recall)
+    recall = int_count / (pred.sum() + 1)
+    f1 = 2 * acc * recall / (acc + recall)  
     return {'dice': dice,
             'iou': iou,
             'acc': acc,
             'recall': recall,
-            'f1': f1,
-            'fpr': fpr,
-            'tpr': tpr}
+            'f1': f1}
 
 # A wrapper for Sam inference
 class SamInferer:
@@ -78,7 +85,8 @@ class SamInferer:
                     confidence=0.8,
                     topk=2,
                     stable_weight=3,
-                    gamma=1
+                    gamma=1,
+                    label_bins=None
                     ):
         if model_id is None:
             self.predictor = SAM(build_sam2(cfg, ckpt))
@@ -90,7 +98,7 @@ class SamInferer:
         self.hist = None
         self.patience = patience
         self.stable_weight = stable_weight
-        self.back_off = 5
+        self.back_off = back_off
         # self.queue = PriorityQueue()
         self.queue = []
 
@@ -130,7 +138,6 @@ class SamInferer:
         self.w_kernel /= self.w_kernel.max() 
         # TO prevent vanishing
         # self.w_kernel = np.interp(self.w_kernel, np.quantile(self.w_kernel, (0, 1)), (.2, 1))
-        self.clahe = cv2.createCLAHE(clipLimit=2., tileGridSize=(51, 51))
         self.gamma = gamma
         
         # Uncertainty modelling
@@ -152,6 +159,9 @@ class SamInferer:
         self.root_area = root_area
         self.max_roots = max_roots
         self.topk = topk
+
+        # For conformalization
+        self.label_bins = np.linspace(0, 1, num=40) if label_bins is None else label_bins
     
     def reset(self):
         self.step = 0
@@ -177,6 +187,27 @@ class SamInferer:
         self.roi = None
         self.graph_root = np.zeros([0, 2], dtype=int)
 
+    def predict(self, src, dst): 
+        logit = self.logits[src[0]:dst[0], src[1]:dst[1]] / self.weight[src[0]:dst[0], src[1]:dst[1]]
+        prob_map = utils.sigmoid(logit) if not self.post_act else logit
+        quantized = np.interp(prob_map ** 1.5, (0, 1), (0, 255)).astype(np.uint8)
+        beta_mask = (quantized >= int(self.beta * 255)).astype(np.uint8)
+        b1 = cv2.adaptiveThreshold(quantized, 
+                                            1, 
+                                            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                            cv2.THRESH_BINARY, 
+                                            91, 
+                                            -15) * (quantized > 50) 
+        b2 = cv2.adaptiveThreshold(quantized, 
+                                            1, 
+                                            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                            cv2.THRESH_BINARY, 
+                                            121, 
+                                            -15) * (quantized > 80)
+        mask = np.maximum(beta_mask, np.maximum(b1, b2))
+        mask = utils.prune(mask, min_size=500)
+        return mask
+
     def pop(self):
         if len(self.queue) == 0:
             # print("Empty queue !!!")
@@ -186,21 +217,16 @@ class SamInferer:
         return item
             
     def valid_pts(self, pts):
-            pts -= self.root[None, :]
-            check = np.ones(pts.shape[0])
-            for i in range(pts.shape[1]):
-                check *= np.where((pts[:, i] > 0) & (pts[:, i] < self.patch_size[i]), 1, 0)
-            return pts[np.where(check > 0)]  
+        pts -= self.root[None, :]
+        check = np.ones(pts.shape[0])
+        for i in range(pts.shape[1]):
+            check *= np.where((pts[:, i] > 0) & (pts[:, i] < self.patch_size[i]), 1, 0)
+        return pts[np.where(check > 0)]  
         
-    def compose_prompts(self, pos, neg):
+    def compose_prompts(self, pos, valid_neg):
         valid_pos = self.valid_pts(pos.copy())
         pos_label = np.ones(valid_pos.shape[0])
         # Generated locally so no need for projection
-        if self.neg.shape[0] > 0:
-            valid_neg = self.valid_pts(self.neg.copy())
-            valid_neg = np.concatenate([valid_neg, neg], axis=0)
-        else: 
-            valid_neg = np.ones([0, 2])
             
         if valid_neg.shape[0] == 0:
             return valid_pos[:, ::-1].copy(), pos_label
@@ -254,6 +280,9 @@ class SamInferer:
         negative_field = gradient * (1 - alpha_mask)
         # Discretize to 5 bin
         output = utils.grid_sampling(negative_field.astype(float), grid=self.neg_sampling_grid, alpha=0.01)
+        if self.neg.shape[0] > 0:
+            negative = self.valid_pts(self.neg)
+            output = np.concatenate([negative, output])
         dis = np.triu(np.linalg.norm(output[None, :] - output[:, None, :], axis=2))
         dis[dis == 0] = 1e5
         drop = np.where(dis < self.neg_dis)[0]
@@ -275,7 +304,7 @@ class SamInferer:
     def get_inbound(self, src, dst):
         dis_map = self.dis_map[src[0]:dst[0], src[1]:dst[1]]
         ske_map = np.linalg.norm(dis_map, axis=2)
-        mask = 1 - scipy.ndimage.binary_erosion(np.ones_like(ske_map), iterations=2)
+        mask = 1 - scipy.ndimage.binary_erosion(np.ones_like(ske_map), iterations=5)
         pos = np.stack(np.where(mask * ske_map > 0)).T.astype(int)
         if pos.shape[0] == 0:
             return {'point': np.zeros([0, 2], dtype=int),
@@ -290,6 +319,7 @@ class SamInferer:
         # print(np.stack([pos, center_di, direction], axis=1))
         # Take dominant 
         valid = (np.take_along_axis(direction * center_di, axis[:, None], axis=1) >= 0).flatten()
+
         # print(f"Direction: {direction}, valid in {valid}")
         return {'point': pos[valid].copy().reshape(-1, 2),
                 'direction': direction[valid].copy().reshape(-1, 2)}
@@ -356,7 +386,8 @@ class SamInferer:
         patch = self.image[self.root[0]:dst[0], self.root[1]:dst[1]].copy()
         self.predictor.set_image(patch)
         # Positional Preparation
-        input_mask = skimage.morphology.erosion(self.b_mask[self.root[0]:dst[0], self.root[1]:dst[1]].copy())
+        # input_mask = self.b_mask[self.root[0]:dst[0], self.root[1]:dst[1]].copy()
+        input_mask = cv2.erode(self.predict(self.root, dst), self.fill_kernel, iterations=2)
         # input_mask = 0
         if 'branch' in nested_prompt.keys():
             available = 1 - scipy.ndimage.binary_fill_holes(input_mask).astype(np.uint8)
@@ -366,10 +397,13 @@ class SamInferer:
             pts = pts[valid, :]
             # print("Branch in the prompt", pts.shape)
             path_map[pts[:, 0], pts[:, 1]] = 1
-            self.hist[self.root[0]: dst[0], self.root[1]:dst[1]] += cv2.dilate(path_map, self.fill_kernel, iterations=10) * self.w_kernel * 2
+            self.hist[self.root[0]: dst[0], self.root[1]:dst[1]] += cv2.dilate(path_map, self.fill_kernel, iterations=30) * self.w_kernel
             path_map *= available
             input_mask = np.maximum(input_mask, path_map)
+            # self.atlas[self.root[0]: dst[0], self.root[1]:dst[1]] = np.maximum(self.atlas[self.root[0]: dst[0], self.root[1]:dst[1]], path_map)
+        # input_mask = np.maximum(input_mask, cv2.dilate(self.atlas[self.root[0]: dst[0], self.root[1]:dst[1]], np.ones([3, 3], dtype=np.uint8)))
         input_mask = cv2.resize(input_mask.astype(np.uint8), (256, 256))
+        # input_mask = cv2.resize(self.predict(self.root, dst), (256, 256))
         pos = np.concatenate([np.array(prompt)[None, :], self.gather_prompts(prompt)], axis=0).astype(int)
         # print("Prompts:", pos)
         base_root['point'] = np.concatenate([base_root['point'], pos - self.root[None, :]], axis=0)
@@ -426,21 +460,25 @@ class SamInferer:
         w_pts = np.array(np.where((w_map > 0) * (w_map < 5))).T
         # print("Skeleton size:", w_pts.shape[0])
         if w_pts.shape[0] > 4000:
+            # print("Mask dilated too much")
             return False, None, None
         
         dist = np.linalg.norm(w_pts - graph_root, axis=1)
         nn = w_pts[np.argmin(dist)]
+        # print(graph_root, nn)
         # Flow porting
         # Update available mask
         # ref_mask = self.b_mask[root[0]: dst[0], root[1]:dst[1]].copy()
+        
         tree = utils.unilateral_dfs_tree( w_map.copy(), 
                                     mask, 
                                     tuple(nn), 
                                     b_mask=b_mask,
                                     alpha=0.01, 
-                                    thresh=0.8,
-                                    dis_map=self.dis_map[self.root[0]: dst[0], self.root[1]:dst[1]],
+                                    thresh=self.stable_thresh,
+                                    dis_map=self.dis_map[self.root[0]: dst[0], self.root[1]:dst[1]].copy(),
                                     context_size=15,
+                                    tolerance=-0.5
                                   )
         # unilateral_dfs_tree(g_mask, inp_mask, start, weight = 1, alpha=0.1, thresh=0.95, context_size=3, dis_map=None)
         # Ordering from leaves to roots
@@ -450,11 +488,12 @@ class SamInferer:
         cost_map = tree['cost']
         branches = utils.longest_path_branching(tree['dfs_tree'], tuple(nn), dead=tree['dead'])
         valid_branches = [branches[i] for i in range(len(branches)) if len(branches[i]) >= self.min_length]
+        # print(len(branches), len(valid_branches), [len(branch) for branch in branches])
         # Cost as normalized energy function along the geodesics
         costs = [cost_map[branch[0][0], branch[0][1]] / len(branch) for branch in valid_branches]
         return True, sorted(zip(costs, valid_branches), key=lambda x: x[0]), tree
     
-    def iter(self, seg_res=None, debug=False):
+    def iter(self, seg_res=None, debug=False, inspect=None):
         self.step += 1
         if seg_res is None:
             seg_res = self.infer(debug=debug) 
@@ -474,13 +513,13 @@ class SamInferer:
         # Model was trained to get threshold at 0.5 intuitively
         if (prob_map >= self.alpha).sum() < self.root_area: 
             return {'ret': False}
-        # sv = [0, 
-        #       self.alpha / 2, 
-        #       np.quantile(prob_map[prob_map >= self.alpha], 0.2), 
-        #       np.quantile(prob_map[prob_map >= self.alpha], 0.5), 
-        #       1]
-        # dv = [0, 0, self.alpha * 0.8 + 0.2, self.alpha * 0.5 + 0.5, 1]
-        sv, dv = [0, 1], [0, 1]
+        sv = [0, 
+              self.alpha / 2, 
+              np.quantile(prob_map[prob_map >= self.alpha], 0.2), 
+              np.quantile(prob_map[prob_map >= self.alpha], 0.5), 
+              1]
+        dv = [0, 0, self.alpha * 0.8 + 0.2, self.alpha * 0.5 + 0.5, 1]
+        # sv, dv = [0, 1], [0, 1]
         # print(sv, dv)
         if self.post_act:
             normed_map = scipy.ndimage.gaussian_filter(np.interp(prob_map, sv, dv), sigma=0.5) 
@@ -518,7 +557,7 @@ class SamInferer:
         # confidence = np.where(offset < 0, 1 - confidence, confidence)
         unstable = np.abs(confidence - 0.5) >= (self.confidence / 2) 
         stable = (prev_var < 0.05 * max_dev) & (self.weight[self.root[0]: dst[0], self.root[1]:dst[1]] >= self.confidence * self.stable_weight) & roi
-        stable = stable | (seg_res['inp_mask'] > 0)
+        stable = stable | ((seg_res['inp_mask'] > 0) & positive) 
         # If the overlap is too shallow, preserves the ensemble output
         if liou < 0.5:
             tn = true & ~positive 
@@ -560,8 +599,6 @@ class SamInferer:
         # Get possible
         window_size = max(self.patch_size) // self.neg_sampling_grid
         window_size += window_size % 2 - 1
-        dilated_window_size = int(float(window_size) * 1.3) 
-        dilated_window_size += dilated_window_size % 2 - 1
         discrete = cv2.adaptiveThreshold(quantized_conf, 
                                             1, 
                                             cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
@@ -575,7 +612,7 @@ class SamInferer:
                                             1, 
                                             cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                             cv2.THRESH_BINARY, 
-                                            dilated_window_size, 
+                                            window_size, 
                                             - max(5, int(self.d_alpha * prob_dev * 255))) * (quantized_conf >= self.alpha * 255)
         possible = possible + (1 - possible) * beta_mask
         # Process 
@@ -628,7 +665,7 @@ class SamInferer:
         direction = []
         for i, root in enumerate(graph_root['point']):
             # print(root)
-            root = np.array([max(0, min(sz, item)) for sz, item in zip(self.patch_size, root)], dtype=int)
+            root = np.array([max(0, min(sz, item)) for sz, item in zip(self.patch_size - 1, root)], dtype=int)
             if (acp_mask[root[0], root[1]] == 1) or (ref_mask[root[0], root[1]] == 0):
                 continue
             roots.append(root)
@@ -661,7 +698,6 @@ class SamInferer:
         result_mask = np.zeros_like(ref_mask)
         canvas = np.zeros_like(thin_w)
         for root in roots:
-            # Insert here
             # print(root)
             # Update history
             if beta_mask[root[0], root[1]] == 1:
@@ -673,6 +709,7 @@ class SamInferer:
                                                 b_mask=beta_mask
                                               )
             if not ret: 
+                # print("Tree not accepted")
                 continue
             # valid_branches = [case[1] for case in valid_branches]
             cost = tree['cost']
@@ -709,8 +746,28 @@ class SamInferer:
         # self.b_mask[self.root[0]: dst[0], self.root[1]:dst[1]][unstable] = result_mask[unstable].copy()
         self.atlas[self.root[0]: dst[0], self.root[1]:dst[1]] = np.maximum(self.atlas[self.root[0]: dst[0], self.root[1]:dst[1]], canvas)
         metrics = eval(self.b_mask[self.root[0]: dst[0], self.root[1]:dst[1]].copy(), self.label[self.root[0]: dst[0], self.root[1]:dst[1]])
-
+        rc_curve = roc_curve(prob_map, self.label[self.root[0]: dst[0], self.root[1]:dst[1]].copy(), step=40)
+        label_prob_map = np.histogram(prob_map[self.label[self.root[0]: dst[0], self.root[1]:dst[1]] > 0], bins=self.label_bins, density=True)[0]
         if debug:
+            profiles = []
+            update = None
+            if inspect is not None:
+                update = np.zeros(inspect.shape[0], dtype=int)
+                for index, cpt in enumerate(inspect):
+                    num, pt = cpt[0], cpt[1:]     
+                    inp_src, inp_dst = pt - self.patch_size // 2, pt + self.patch_size // 2
+                    if self.hist[inp_src[0]: inp_dst[0], inp_src[1]:inp_dst[1]].max() < num:
+                        profiles.append({'ret': False})
+                    else:
+                        num += 1
+                        update[index] = 1
+                        profiles.append({   'index': index,
+                                            'iter': int(num),
+                                            'pt': pt,
+                                            'ret': True, 
+                                            'mask': self.b_mask[inp_src[0]: inp_dst[0], inp_src[1]:inp_dst[1]].copy(),
+                                            'logit': self.logits[inp_src[0]: inp_dst[0], inp_src[1]:inp_dst[1]] / self.weight[inp_src[0]: inp_dst[0], inp_src[1]:inp_dst[1]],
+                                            'weight': self.weight[inp_src[0]: inp_dst[0], inp_src[1]:inp_dst[1]]})  
             return {'ret': True,
                     'marker': marker,
                     'roots': {'pts': roots, 'directions': direction},
@@ -725,7 +782,10 @@ class SamInferer:
                     'branches': total_branches,
                     'possible': possible,
                     'canvas': canvas,
-                    'metrics': metrics
+                    'metrics': metrics,
+                    'rc_curve': rc_curve,
+                    'label_prob_map': label_prob_map,
+                    'inspect': {'profile': profiles, 'add': update}
                     }
         else: 
             return {'ret': True,

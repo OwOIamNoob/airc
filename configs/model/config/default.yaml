@@ -1,0 +1,23 @@
+# config/default.yaml
+defaults:
+  - years@y2015: 2015.yaml
+  - years@y2016: 2016.yaml
+  - years@y2017: 2017.yaml
+  - years@y2018: 2018.yaml
+  - years@y2019: 2019.yaml
+  - years@y2020: 2020.yaml
+  - years@y2021: 2021.yaml
+  - years@y2022: 2022.yaml
+  - years@y2023: 2023.yaml
+
+# (optional) gather them into a list
+years_list:
+  - ${y2015}
+  - ${y2016}
+  - ${y2017}
+  - ${y2018}
+  - ${y2019}
+  - ${y2020}
+  - ${y2021}
+  - ${y2022}
+  - ${y2023}
